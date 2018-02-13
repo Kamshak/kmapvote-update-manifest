@@ -1,8 +1,23 @@
 var htmlparser = Promise = require('bluebird'),
   _ = require('lodash'),
-  AWS = require('aws-sdk');
+  AWS = require('aws-sdk'),
+  promisePipe = require('promisepipe'),
+  pngquant = require('pngquant')
+  fs = require('fs'),
+  sharp = require('sharp'),
+  streamifier = require('into-stream'),
+  meter = require('stream-meter'),
+  retry = require('bluebird-retry');
 
 require('dotenv').load();
+
+let Duplex = require('stream').Duplex;  
+function bufferToStream(buffer) {  
+  let stream = new Duplex();
+  stream.push(buffer);
+  stream.end(null);
+  return stream;
+}
 
 AWS.config.update({region: process.env.AWS_REGION});
 
@@ -24,6 +39,63 @@ function getAllKeys(marker) {
         }
         return response.Contents;
     }) 
+}
+
+function streamToBuffer(stream) {  
+  return new Promise((resolve, reject) => {
+    let buffers = [];
+    stream.on('error', reject);
+    stream.on('data', (data) => buffers.push(data));
+    stream.on('end', () => resolve(Buffer.concat(buffers)));
+  });
+}
+
+function optimizePngs() {
+  return getAllKeys()
+    .then(function(data) {
+      const icons = _(data).pluck('Key').map(function(key) {
+        return decodeURIComponent(key.replace(process.env.INPUT_PREFIX, ""));
+      }).toArray().value();
+      console.log("Found", icons.length);
+      return icons;
+    }).map(async key => {
+      let result;
+      try {
+        result = (await s3.getObjectAsync({
+          Bucket: process.env.INPUT_BUCKET,
+          Key: `mapicons/${key}`,
+        }));
+      } catch(e) {
+        console.error(key, e);
+        return false;
+      }
+
+      if (result.ContentType !== 'image/png') {
+        console.log('skipping', key);
+        return false;
+      }
+
+      const counter = meter();
+      const quanter = new pngquant([192, '--quality', '60-80', '--nofs', '-']);
+      try {
+        await retry(() => promisePipe(
+          streamifier(result.Body),
+          sharp().png().toFormat('png'),
+          quanter,
+          counter,
+          fs.createWriteStream('test/' + key)
+        ), { interval: 0, max_tries: 3 });
+  
+        await s3.putObjectAsync({
+          Bucket: process.env.OUTPUT_BUCKET,
+          Key: 'mapicons-small/' + key,
+          ACL: 'public-read',
+          Body: fs.createReadStream('test/' + key)
+        });
+      } catch(e) {
+        console.log(key, e);
+      }
+    }, { concurrency: 150 });
 }
 
 exports.handler = function(event, context) {
@@ -71,6 +143,8 @@ exports.handler = function(event, context) {
 }
 
 if (require.main === module) {
+
+  //optimizePngs().then(x => console.log("done"), e => console.error(e));
     exports.handler(null, {
         succeed: console.log.bind(console),
         fail: console.error.bind(console)
